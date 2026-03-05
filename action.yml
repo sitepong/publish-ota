@@ -1,0 +1,133 @@
+name: 'SitePong Publish OTA Update'
+description: 'Publish Expo OTA updates to SitePong using GitHub OIDC trusted publishing (no API key needed)'
+
+inputs:
+  project-id:
+    description: 'SitePong project ID'
+    required: true
+  runtime-version:
+    description: 'Expo runtime version'
+    required: true
+  changelog:
+    description: 'Changelog for this OTA update'
+    required: true
+  app-version:
+    description: 'App version (e.g. 1.0.0). If omitted, inherits from the latest native build.'
+    required: false
+    default: ''
+  platform:
+    description: 'Target platform (ios, android, or all)'
+    default: 'all'
+  working-directory:
+    description: 'Path to the app root within the repo (e.g. app, mobile-app, packages/mobile)'
+    default: '.'
+  dist-dir:
+    description: 'Directory containing the expo export output (relative to working-directory)'
+    default: 'dist'
+  updates-url:
+    description: 'SitePong updates server URL'
+    default: 'https://updates.sitepong.com'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Get OIDC token
+      id: oidc
+      shell: bash
+      run: |
+        OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.updates-url }}" | jq -r '.value')
+        if [ "$OIDC_TOKEN" = "null" ] || [ -z "$OIDC_TOKEN" ]; then
+          echo "::error::Failed to get OIDC token. Ensure 'permissions: id-token: write' is set."
+          exit 1
+        fi
+        echo "::add-mask::$OIDC_TOKEN"
+        echo "token=$OIDC_TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Exchange for publish token
+      id: exchange
+      shell: bash
+      run: |
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/token/exchange" \
+          -H "Content-Type: application/json" \
+          -d "{\"oidc_token\": \"${{ steps.oidc.outputs.token }}\", \"project_id\": \"${{ inputs.project-id }}\"}")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::error::Token exchange failed ($HTTP_CODE): $BODY"
+          exit 1
+        fi
+        PUBLISH_TOKEN=$(echo "$BODY" | jq -r '.token')
+        echo "::add-mask::$PUBLISH_TOKEN"
+        echo "token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Publish OTA update
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        DIST_DIR="${{ inputs.dist-dir }}"
+        if [ ! -d "$DIST_DIR" ]; then
+          echo "::error::Distribution directory '$DIST_DIR' not found. Run 'npx expo export' first."
+          exit 1
+        fi
+
+        PLATFORMS="${{ inputs.platform }}"
+        if [ "$PLATFORMS" = "all" ]; then
+          PLATFORMS="ios android"
+        fi
+
+        for PLATFORM in $PLATFORMS; do
+          BUNDLE_DIR="$DIST_DIR/_expo/static/js/$PLATFORM"
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            echo "::warning::No $PLATFORM bundles found in $BUNDLE_DIR, skipping"
+            continue
+          fi
+
+          # Build curl multipart args
+          CURL_ARGS=(
+            -s -w "\n%{http_code}"
+            -X POST "${{ inputs.updates-url }}/publish"
+            -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}"
+            -F "runtimeVersion=${{ inputs.runtime-version }}"
+            -F "platform=$PLATFORM"
+            -F "changelog=${{ inputs.changelog }}"
+          )
+
+          # Add app_version if provided
+          if [ -n "${{ inputs.app-version }}" ]; then
+            CURL_ARGS+=(-F "app_version=${{ inputs.app-version }}")
+          fi
+
+          # Add bundle files (skip sourcemaps)
+          FILE_COUNT=0
+          for FILE in "$BUNDLE_DIR"/*; do
+            [ -f "$FILE" ] || continue
+            case "$FILE" in *.map) continue ;; esac
+            CURL_ARGS+=(-F "file=@$FILE")
+            FILE_COUNT=$((FILE_COUNT + 1))
+          done
+
+          # Add shared assets
+          ASSETS_DIR="$DIST_DIR/assets"
+          if [ -d "$ASSETS_DIR" ]; then
+            for FILE in "$ASSETS_DIR"/*; do
+              [ -f "$FILE" ] || continue
+              CURL_ARGS+=(-F "file=@$FILE")
+              FILE_COUNT=$((FILE_COUNT + 1))
+            done
+          fi
+
+          echo "Publishing $PLATFORM update ($FILE_COUNT files)..."
+
+          RESPONSE=$(curl "${CURL_ARGS[@]}")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "::error::Publish failed for $PLATFORM ($HTTP_CODE): $BODY"
+            exit 1
+          fi
+
+          echo "Successfully published $PLATFORM update"
+          echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+        done
