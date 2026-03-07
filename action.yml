@@ -61,6 +61,20 @@ runs:
         echo "::add-mask::$PUBLISH_TOKEN"
         echo "token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
 
+    - name: Compute package hash
+      id: pkghash
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ ! -f "package.json" ]; then
+          echo "::error::package.json not found in working directory"
+          exit 1
+        fi
+        HASH=$(sha256sum package.json 2>/dev/null || shasum -a 256 package.json)
+        HASH=$(echo "$HASH" | cut -d' ' -f1)
+        echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+        echo "Package hash: $HASH"
+
     - name: Publish OTA update
       shell: bash
       working-directory: ${{ inputs.working-directory }}
@@ -91,6 +105,7 @@ runs:
             -F "runtimeVersion=${{ inputs.runtime-version }}"
             -F "platform=$PLATFORM"
             -F "changelog=${{ inputs.changelog }}"
+            -F "packageHash=${{ steps.pkghash.outputs.hash }}"
           )
 
           # Add app_version if provided
