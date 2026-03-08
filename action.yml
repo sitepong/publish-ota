@@ -117,8 +117,13 @@ runs:
           if [ -f "$DIST_DIR/metadata.json" ]; then
             CURL_ARGS+=(-F "expoMetadata=@$DIST_DIR/metadata.json;type=application/json")
           fi
+          # Send expoConfig for manifest extra.expoClient (required by native expo-updates)
           if [ -f "$DIST_DIR/expoConfig.json" ]; then
             CURL_ARGS+=(-F "expoConfig=@$DIST_DIR/expoConfig.json;type=application/json")
+          elif [ -f "app.json" ]; then
+            # Extract expo config from app.json (newer expo versions don't export expoConfig.json)
+            EXPO_CONFIG=$(node -e "const c = require('./app.json'); console.log(JSON.stringify(c.expo || c))")
+            CURL_ARGS+=(-F "expoConfig=$EXPO_CONFIG")
           fi
 
           # Add bundle files (skip sourcemaps)
