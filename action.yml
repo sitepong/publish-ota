@@ -113,6 +113,14 @@ runs:
             CURL_ARGS+=(-F "app_version=${{ inputs.app-version }}")
           fi
 
+          # Add expo metadata files (content types + app config for manifest)
+          if [ -f "$DIST_DIR/metadata.json" ]; then
+            CURL_ARGS+=(-F "expoMetadata=@$DIST_DIR/metadata.json;type=application/json")
+          fi
+          if [ -f "$DIST_DIR/expoConfig.json" ]; then
+            CURL_ARGS+=(-F "expoConfig=@$DIST_DIR/expoConfig.json;type=application/json")
+          fi
+
           # Add bundle files (skip sourcemaps)
           FILE_COUNT=0
           for FILE in "$BUNDLE_DIR"/*; do
