@@ -24,10 +24,6 @@ inputs:
   dist-dir:
     description: 'Directory containing the expo export output (relative to working-directory)'
     default: 'dist'
-  channel:
-    description: 'OTA channel name (e.g. default, staging, production). Defaults to branch name (main→default).'
-    required: false
-    default: ''
   updates-url:
     description: 'SitePong updates server URL'
     default: 'https://updates.sitepong.com'
@@ -117,10 +113,6 @@ runs:
             CURL_ARGS+=(-F "app_version=${{ inputs.app-version }}")
           fi
 
-          # Add channel name if provided
-          if [ -n "${{ inputs.channel }}" ]; then
-            CURL_ARGS+=(-F "name=${{ inputs.channel }}")
-          fi
 
           # Add expo metadata files (content types + app config for manifest)
           if [ -f "$DIST_DIR/metadata.json" ]; then
