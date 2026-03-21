@@ -24,6 +24,10 @@ inputs:
   dist-dir:
     description: 'Directory containing the expo export output (relative to working-directory)'
     default: 'dist'
+  channel:
+    description: 'OTA channel name. Defaults to branch name (main/master→default, other→branch name).'
+    required: false
+    default: ''
   updates-url:
     description: 'SitePong updates server URL'
     default: 'https://updates.sitepong.com'
@@ -97,6 +101,17 @@ runs:
             continue
           fi
 
+          # Resolve channel: explicit input > branch name > default
+          CHANNEL="${{ inputs.channel }}"
+          if [ -z "$CHANNEL" ]; then
+            BRANCH="${GITHUB_REF#refs/heads/}"
+            if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+              CHANNEL="default"
+            else
+              CHANNEL="$BRANCH"
+            fi
+          fi
+
           # Build curl multipart args
           CURL_ARGS=(
             -s -w "\n%{http_code}"
@@ -106,6 +121,7 @@ runs:
             -F "platform=$PLATFORM"
             -F "changelog=${{ inputs.changelog }}"
             -F "packageHash=${{ steps.pkghash.outputs.hash }}"
+            -F "name=$CHANNEL"
           )
 
           # Add app_version if provided
