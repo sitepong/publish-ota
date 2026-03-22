@@ -11,6 +11,9 @@ inputs:
   changelog:
     description: 'Changelog for this OTA update'
     required: true
+  profile:
+    description: 'SitePong build profile name (e.g. Development, Production). Required — used to resolve EXPO_PUBLIC_* env vars for the JS bundle.'
+    required: true
   app-version:
     description: 'App version (e.g. 1.0.0). If omitted, inherits from the latest native build.'
     required: false
@@ -31,6 +34,10 @@ inputs:
   updates-url:
     description: 'SitePong updates server URL'
     default: 'https://updates.sitepong.com'
+  skip-export:
+    description: 'Skip expo export (if you already ran it with env vars set up). Default: false.'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -64,6 +71,39 @@ runs:
         PUBLISH_TOKEN=$(echo "$BODY" | jq -r '.token')
         echo "::add-mask::$PUBLISH_TOKEN"
         echo "token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch environment variables from SitePong
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Fetching EXPO_PUBLIC_* env vars for profile '${{ inputs.profile }}'..."
+        RESPONSE=$(curl -s -w "\n%{http_code}" \
+          "${{ inputs.updates-url }}/env-vars?profile=${{ inputs.profile }}" \
+          -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "::error::Failed to fetch env vars ($HTTP_CODE): $BODY"
+          exit 1
+        fi
+
+        # Write env vars to .env file
+        echo "$BODY" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"' > .env
+        ENV_COUNT=$(wc -l < .env | tr -d ' ')
+        echo "Wrote $ENV_COUNT env vars to .env"
+
+    - name: Export Expo bundle
+      if: inputs.skip-export != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        PLATFORMS="${{ inputs.platform }}"
+        if [ "$PLATFORMS" = "all" ]; then
+          npx expo export --platform all
+        else
+          npx expo export --platform $PLATFORMS
+        fi
 
     - name: Compute package hash
       id: pkghash
