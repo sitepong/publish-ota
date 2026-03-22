@@ -72,7 +72,7 @@ runs:
         echo "::add-mask::$PUBLISH_TOKEN"
         echo "token=$PUBLISH_TOKEN" >> "$GITHUB_OUTPUT"
 
-    - name: Fetch environment variables from SitePong
+    - name: Fetch env vars and export to GITHUB_ENV
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
@@ -88,10 +88,18 @@ runs:
           exit 1
         fi
 
-        # Write env vars to .env file
-        echo "$BODY" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"' > .env
-        ENV_COUNT=$(wc -l < .env | tr -d ' ')
-        echo "Wrote $ENV_COUNT env vars to .env"
+        # Write to .env for tools that read it, AND export to GITHUB_ENV
+        # so they're available as real shell env vars in subsequent steps
+        ENV_LINES=$(echo "$BODY" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"')
+        echo "$ENV_LINES" > .env
+        echo "$ENV_LINES" >> "$GITHUB_ENV"
+        ENV_COUNT=$(echo "$ENV_LINES" | wc -l | tr -d ' ')
+        echo "Exported $ENV_COUNT env vars to GITHUB_ENV and .env"
+
+        # Log the keys (not values) for debugging
+        echo "$BODY" | jq -r '.env | keys[]' | while read key; do
+          echo "  - $key"
+        done
 
     - name: Export Expo bundle
       if: inputs.skip-export != 'true'
@@ -168,7 +176,6 @@ runs:
           if [ -n "${{ inputs.app-version }}" ]; then
             CURL_ARGS+=(-F "app_version=${{ inputs.app-version }}")
           fi
-
 
           # Add expo metadata files (content types + app config for manifest)
           if [ -f "$DIST_DIR/metadata.json" ]; then
