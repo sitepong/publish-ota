@@ -39,6 +39,17 @@ inputs:
     required: false
     default: 'false'
 
+  upload-sourcemaps:
+    description: >-
+      Upload the *.map files next to each bundle so SitePong can symbolicate
+      error stack traces for this update (stored with release = update id).
+      When the action runs `expo export` itself it passes `--source-maps`
+      (alias `--dump-sourcemap`; @expo/cli 55). With skip-export: true you
+      must run `npx expo export --source-maps` yourself or no maps exist to
+      upload. Default: true.
+    required: false
+    default: 'true'
+
 runs:
   using: 'composite'
   steps:
@@ -107,11 +118,14 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         PLATFORMS="${{ inputs.platform }}"
-        if [ "$PLATFORMS" = "all" ]; then
-          npx expo export --platform all
-        else
-          npx expo export --platform $PLATFORMS
+        EXPORT_ARGS=(--platform "$PLATFORMS")
+        # Source maps are opt-in for `expo export` (`-s, --source-maps`,
+        # alias `--dump-sourcemap`); emit them so the publish step can upload
+        # them for stack-trace symbolication.
+        if [ "${{ inputs.upload-sourcemaps }}" = "true" ]; then
+          EXPORT_ARGS+=(--source-maps)
         fi
+        npx expo export "${EXPORT_ARGS[@]}"
 
     - name: Compute package hash
       id: pkghash
@@ -190,14 +204,29 @@ runs:
             CURL_ARGS+=(-F "expoConfig=$EXPO_CONFIG")
           fi
 
-          # Add bundle files (skip sourcemaps)
+          # Add bundle files. Source maps (*.map, emitted by `expo export
+          # --source-maps`) ride along in the same multipart POST when
+          # upload-sourcemaps is true; the server stores them in source_maps
+          # under release = update id and never serves them as OTA assets.
+          UPLOAD_SOURCEMAPS="${{ inputs.upload-sourcemaps }}"
           FILE_COUNT=0
+          MAP_COUNT=0
           for FILE in "$BUNDLE_DIR"/*; do
             [ -f "$FILE" ] || continue
-            case "$FILE" in *.map) continue ;; esac
+            case "$FILE" in
+              *.map)
+                [ "$UPLOAD_SOURCEMAPS" = "true" ] || continue
+                CURL_ARGS+=(-F "file=@$FILE;type=application/json")
+                MAP_COUNT=$((MAP_COUNT + 1))
+                continue
+                ;;
+            esac
             CURL_ARGS+=(-F "file=@$FILE")
             FILE_COUNT=$((FILE_COUNT + 1))
           done
+          if [ "$UPLOAD_SOURCEMAPS" = "true" ] && [ "$MAP_COUNT" -eq 0 ]; then
+            echo "::warning::No source maps found in $BUNDLE_DIR — run 'npx expo export --source-maps' so $PLATFORM errors can be symbolicated"
+          fi
 
           # Add shared assets
           ASSETS_DIR="$DIST_DIR/assets"
@@ -209,7 +238,7 @@ runs:
             done
           fi
 
-          echo "Publishing $PLATFORM update ($FILE_COUNT files)..."
+          echo "Publishing $PLATFORM update ($FILE_COUNT files, $MAP_COUNT source maps)..."
 
           RESPONSE=$(curl "${CURL_ARGS[@]}")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
