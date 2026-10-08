@@ -53,12 +53,18 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Every input reaches the scripts below through `env:` and is used as a
+    # quoted shell variable. Never paste ${{ inputs.* }} into a `run:` block:
+    # a changelog with a double quote broke the quoting, and one with $(...)
+    # would have run on the runner with the publish token in scope.
     - name: Get OIDC token
       id: oidc
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
       run: |
         OIDC_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.updates-url }}" | jq -r '.value')
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$UPDATES_URL" | jq -r '.value')
         if [ "$OIDC_TOKEN" = "null" ] || [ -z "$OIDC_TOKEN" ]; then
           echo "::error::Failed to get OIDC token. Ensure 'permissions: id-token: write' is set."
           exit 1
@@ -69,10 +75,15 @@ runs:
     - name: Exchange for publish token
       id: exchange
       shell: bash
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
+        PROJECT_ID: ${{ inputs.project-id }}
+        OIDC_TOKEN: ${{ steps.oidc.outputs.token }}
       run: |
-        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ inputs.updates-url }}/token/exchange" \
+        PAYLOAD=$(jq -n --arg t "$OIDC_TOKEN" --arg p "$PROJECT_ID" '{oidc_token: $t, project_id: $p}')
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$UPDATES_URL/token/exchange" \
           -H "Content-Type: application/json" \
-          -d "{\"oidc_token\": \"${{ steps.oidc.outputs.token }}\", \"project_id\": \"${{ inputs.project-id }}\"}")
+          --data-binary "$PAYLOAD")
         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
         BODY=$(echo "$RESPONSE" | sed '$d')
         if [ "$HTTP_CODE" != "200" ]; then
@@ -86,11 +97,15 @@ runs:
     - name: Fetch env vars and export to GITHUB_ENV
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        UPDATES_URL: ${{ inputs.updates-url }}
+        PROFILE: ${{ inputs.profile }}
+        PUBLISH_TOKEN: ${{ steps.exchange.outputs.token }}
       run: |
-        echo "Fetching EXPO_PUBLIC_* env vars for profile '${{ inputs.profile }}'..."
-        RESPONSE=$(curl -s -w "\n%{http_code}" \
-          "${{ inputs.updates-url }}/env-vars?profile=${{ inputs.profile }}" \
-          -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}")
+        echo "Fetching EXPO_PUBLIC_* env vars for profile '$PROFILE'..."
+        RESPONSE=$(curl -s -w "\n%{http_code}" -G "$UPDATES_URL/env-vars" \
+          --data-urlencode "profile=$PROFILE" \
+          -H "Authorization: Bearer $PUBLISH_TOKEN")
         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
         BODY=$(echo "$RESPONSE" | sed '$d')
 
@@ -99,30 +114,46 @@ runs:
           exit 1
         fi
 
-        # Write to .env for tools that read it, AND export to GITHUB_ENV
-        # so they're available as real shell env vars in subsequent steps
-        ENV_LINES=$(echo "$BODY" | jq -r '.env | to_entries[] | "\(.key)=\(.value)"')
-        echo "$ENV_LINES" > .env
-        echo "$ENV_LINES" >> "$GITHUB_ENV"
-        ENV_COUNT=$(echo "$ENV_LINES" | wc -l | tr -d ' ')
-        echo "Exported $ENV_COUNT env vars to GITHUB_ENV and .env"
-
-        # Log the keys (not values) for debugging
-        echo "$BODY" | jq -r '.env | keys[]' | while read key; do
-          echo "  - $key"
+        # Mask every value before anything can print it (expo export echoes
+        # its environment, which is how a live token reached the log). Values
+        # of 3 characters or fewer are skipped: GitHub would then blank every
+        # "1" or "on" in the whole log, and they are not secrets.
+        echo "$BODY" | jq -r '.env | to_entries[] | .value | tostring' | while IFS= read -r line; do
+          if [ ${#line} -gt 3 ]; then echo "::add-mask::$line"; fi
         done
+
+        # .env for tools that read it, and GITHUB_ENV so later steps get real
+        # shell vars. GITHUB_ENV uses the delimiter form so a value containing
+        # a newline cannot inject another variable.
+        : > .env
+        COUNT=0
+        while IFS= read -r KEY; do
+          VALUE=$(echo "$BODY" | jq -r --arg k "$KEY" '.env[$k] | tostring')
+          printf '%s=%s\n' "$KEY" "$VALUE" >> .env
+          DELIM="SITEPONG_ENV_$(openssl rand -hex 8)"
+          {
+            printf '%s<<%s\n' "$KEY" "$DELIM"
+            printf '%s\n' "$VALUE"
+            printf '%s\n' "$DELIM"
+          } >> "$GITHUB_ENV"
+          COUNT=$((COUNT + 1))
+          echo "  - $KEY"
+        done < <(echo "$BODY" | jq -r '.env | keys[]' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$')
+        echo "Exported $COUNT env vars to GITHUB_ENV and .env"
 
     - name: Export Expo bundle
       if: inputs.skip-export != 'true'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        PLATFORMS: ${{ inputs.platform }}
+        UPLOAD_SOURCEMAPS: ${{ inputs.upload-sourcemaps }}
       run: |
-        PLATFORMS="${{ inputs.platform }}"
         EXPORT_ARGS=(--platform "$PLATFORMS")
         # Source maps are opt-in for `expo export` (`-s, --source-maps`,
         # alias `--dump-sourcemap`); emit them so the publish step can upload
         # them for stack-trace symbolication.
-        if [ "${{ inputs.upload-sourcemaps }}" = "true" ]; then
+        if [ "$UPLOAD_SOURCEMAPS" = "true" ]; then
           EXPORT_ARGS+=(--source-maps)
         fi
         npx expo export "${EXPORT_ARGS[@]}"
@@ -144,14 +175,23 @@ runs:
     - name: Publish OTA update
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        DIST_DIR: ${{ inputs.dist-dir }}
+        PLATFORMS: ${{ inputs.platform }}
+        INPUT_CHANNEL: ${{ inputs.channel }}
+        UPDATES_URL: ${{ inputs.updates-url }}
+        PUBLISH_TOKEN: ${{ steps.exchange.outputs.token }}
+        RUNTIME_VERSION: ${{ inputs.runtime-version }}
+        CHANGELOG: ${{ inputs.changelog }}
+        PACKAGE_HASH: ${{ steps.pkghash.outputs.hash }}
+        APP_VERSION: ${{ inputs.app-version }}
+        UPLOAD_SOURCEMAPS: ${{ inputs.upload-sourcemaps }}
       run: |
-        DIST_DIR="${{ inputs.dist-dir }}"
         if [ ! -d "$DIST_DIR" ]; then
           echo "::error::Distribution directory '$DIST_DIR' not found. Run 'npx expo export' first."
           exit 1
         fi
 
-        PLATFORMS="${{ inputs.platform }}"
         if [ "$PLATFORMS" = "all" ]; then
           PLATFORMS="ios android"
         fi
@@ -164,7 +204,7 @@ runs:
           fi
 
           # Resolve channel: explicit input > branch name > default
-          CHANNEL="${{ inputs.channel }}"
+          CHANNEL="$INPUT_CHANNEL"
           if [ -z "$CHANNEL" ]; then
             BRANCH="${GITHUB_REF#refs/heads/}"
             if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
@@ -174,21 +214,22 @@ runs:
             fi
           fi
 
-          # Build curl multipart args
+          # Build curl multipart args. Text fields use --form-string: with -F,
+          # a value starting with @ or < is read as a file path.
           CURL_ARGS=(
             -s -w "\n%{http_code}"
-            -X POST "${{ inputs.updates-url }}/publish"
-            -H "Authorization: Bearer ${{ steps.exchange.outputs.token }}"
-            -F "runtimeVersion=${{ inputs.runtime-version }}"
-            -F "platform=$PLATFORM"
-            -F "changelog=${{ inputs.changelog }}"
-            -F "packageHash=${{ steps.pkghash.outputs.hash }}"
-            -F "name=$CHANNEL"
+            -X POST "$UPDATES_URL/publish"
+            -H "Authorization: Bearer $PUBLISH_TOKEN"
+            --form-string "runtimeVersion=$RUNTIME_VERSION"
+            --form-string "platform=$PLATFORM"
+            --form-string "changelog=$CHANGELOG"
+            --form-string "packageHash=$PACKAGE_HASH"
+            --form-string "name=$CHANNEL"
           )
 
           # Add app_version if provided
-          if [ -n "${{ inputs.app-version }}" ]; then
-            CURL_ARGS+=(-F "app_version=${{ inputs.app-version }}")
+          if [ -n "$APP_VERSION" ]; then
+            CURL_ARGS+=(--form-string "app_version=$APP_VERSION")
           fi
 
           # Add expo metadata files (content types + app config for manifest)
@@ -201,14 +242,13 @@ runs:
           elif [ -f "app.json" ]; then
             # Extract expo config from app.json (newer expo versions don't export expoConfig.json)
             EXPO_CONFIG=$(node -e "const c = require('./app.json'); console.log(JSON.stringify(c.expo || c))")
-            CURL_ARGS+=(-F "expoConfig=$EXPO_CONFIG")
+            CURL_ARGS+=(--form-string "expoConfig=$EXPO_CONFIG")
           fi
 
           # Add bundle files. Source maps (*.map, emitted by `expo export
           # --source-maps`) ride along in the same multipart POST when
           # upload-sourcemaps is true; the server stores them in source_maps
           # under release = update id and never serves them as OTA assets.
-          UPLOAD_SOURCEMAPS="${{ inputs.upload-sourcemaps }}"
           FILE_COUNT=0
           MAP_COUNT=0
           for FILE in "$BUNDLE_DIR"/*; do
